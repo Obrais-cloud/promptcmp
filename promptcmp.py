@@ -83,13 +83,16 @@ class ModelResponse:
 # Query runner (streaming)
 # ---------------------------------------------------------------------------
 
-def query_stream(model: str, prompt: str, system: str, result: ModelResponse):
+def query_stream(model: str, prompt: str, system: str, result: ModelResponse, num_ctx: int = 0):
     """Run a streaming query and populate result in-place."""
+    options: dict = {"temperature": 0.7, "num_predict": 2048}
+    if num_ctx:
+        options["num_ctx"] = num_ctx
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": True,
-        "options": {"temperature": 0.7, "num_predict": 2048},
+        "options": options,
     }
     if system:
         payload["system"] = system
@@ -107,6 +110,9 @@ def query_stream(model: str, prompt: str, system: str, result: ModelResponse):
                     err_body = resp.json().get("error", resp.text[:120])
                 except Exception:
                     err_body = resp.text[:120]
+                # Provide actionable hint for OOM crashes
+                if "resource limitations" in err_body or "unexpectedly stopped" in err_body:
+                    err_body += "\n[hint: try --num-ctx 4096 to reduce KV cache memory]"
                 result.error = err_body
                 result.elapsed_s = time.monotonic() - t0
                 result.done = True
@@ -167,6 +173,7 @@ def run_comparison(
     output_path: Path | None,
     no_think: bool,
     sequential: bool = False,
+    num_ctx: int = 0,
 ):
     results = [ModelResponse(model=m) for m in models]
 
@@ -198,7 +205,7 @@ def run_comparison(
         # Run one model at a time — better for large models sharing limited VRAM
         for r in results:
             with Live(build_display(), console=console, refresh_per_second=4) as live:
-                t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r), daemon=True)
+                t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r, num_ctx), daemon=True)
                 t.start()
                 while not r.done:
                     live.update(build_display())
@@ -208,7 +215,7 @@ def run_comparison(
         # Launch all models in parallel
         threads = []
         for r in results:
-            t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r), daemon=True)
+            t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r, num_ctx), daemon=True)
             threads.append(t)
             t.start()
 
@@ -218,16 +225,16 @@ def run_comparison(
                 time.sleep(0.25)
             live.update(build_display())
 
-        # Retry any 500 errors sequentially
-        failed = [r for r in results if r.error and "500" in r.error]
+        # Retry any OOM errors sequentially
+        failed = [r for r in results if r.error and "unexpectedly stopped" in r.error]
         if failed:
-            console.print(f"\n[yellow]Retrying {len(failed)} model(s) sequentially (likely memory contention)…[/yellow]")
+            console.print(f"\n[yellow]Retrying {len(failed)} model(s) sequentially (memory contention)…[/yellow]")
             for r in failed:
                 r.error = ""
                 r.response = ""
                 r.done = False
                 with Live(build_display(), console=console, refresh_per_second=4) as live:
-                    t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r), daemon=True)
+                    t = threading.Thread(target=query_stream, args=(r.model, prompt, system, r, num_ctx), daemon=True)
                     t.start()
                     while not r.done:
                         live.update(build_display())
@@ -312,6 +319,74 @@ def save_markdown(
 
 
 # ---------------------------------------------------------------------------
+# --bench mode: run localeval benchmarks inside promptcmp
+# ---------------------------------------------------------------------------
+
+def _load_localeval():
+    """Import localeval module from sibling dir or ~/localeval/."""
+    import importlib
+    candidates = [
+        Path(__file__).parent / "localeval.py",
+        Path.home() / "localeval" / "localeval.py",
+    ]
+    for p in candidates:
+        if p.exists():
+            parent = str(p.parent)
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            return importlib.import_module("localeval")
+    return None
+
+
+def run_bench_mode(args):
+    """Run localeval benchmark suites and show a leaderboard."""
+    le = _load_localeval()
+    if le is None:
+        console.print(
+            "[red]localeval.py not found.[/red]\n"
+            "Put it alongside promptcmp.py or in ~/localeval/localeval.py\n"
+            "Get it: https://github.com/Obrais-cloud/localeval"
+        )
+        sys.exit(1)
+
+    suite_arg = args.bench or "all"
+    all_suites = list(le.SUITES.keys())
+    if suite_arg == "all":
+        suite_names = all_suites
+    else:
+        suite_names = [s.strip() for s in suite_arg.split(",")]
+        bad = [s for s in suite_names if s not in le.SUITES]
+        if bad:
+            console.print(f"[red]Unknown suites: {bad}. Available: {all_suites}[/red]")
+            sys.exit(1)
+
+    questions = []
+    for s in suite_names:
+        questions.extend(le.SUITES[s])
+
+    available = list_models()
+    models = [m.strip() for m in args.models.split(",")] if args.models else available
+
+    console.print()
+    console.print(Panel(
+        f"[bold]Models:[/bold] {', '.join(models)}\n"
+        f"[bold]Suites:[/bold] {', '.join(suite_names)}\n"
+        f"[bold]Questions:[/bold] {len(questions)} × {len(models)} = "
+        f"{len(questions) * len(models)} total queries",
+        title="[bold green]promptcmp --bench[/bold green]",
+        border_style="green",
+    ))
+
+    results = le.run_evals(models, questions)
+    le.print_leaderboard(results, suite_names)
+
+    if getattr(args, "save", False) or getattr(args, "output", None):
+        out = Path(args.output) if getattr(args, "output", None) else \
+            Path(f"promptcmp_bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
+        le.save_markdown(results, suite_names, out)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -339,6 +414,12 @@ Examples:
                         help="Keep <think> reasoning blocks in output")
     parser.add_argument("--sequential", "-S", action="store_true",
                         help="Run models one at a time (better for large models with limited VRAM)")
+    parser.add_argument("--num-ctx", type=int, default=0,
+                        help="Context window size. Reduce (e.g. 4096) to fix OOM on large models (default: model default)")
+    parser.add_argument("--bench", "-b", nargs="?", const="all", metavar="SUITE",
+                        help="Run structured benchmarks instead of a prompt. "
+                             "SUITE: math, reasoning, coding, general, or all (default: all). "
+                             "Requires localeval.py in the same dir or ~/localeval/")
     parser.add_argument("--list", "-l", action="store_true", help="List available local models")
     parser.add_argument("--json", action="store_true", help="Also dump JSON results to stdout")
 
@@ -348,6 +429,11 @@ Examples:
         models = list_models()
         for m in models:
             console.print(f"  [cyan]•[/cyan] {m}")
+        return
+
+    # --bench mode: delegate to localeval
+    if args.bench:
+        run_bench_mode(args)
         return
 
     # Resolve prompt
@@ -382,7 +468,8 @@ Examples:
     output_path = Path(args.output) if args.output else None
     save = args.save or bool(args.output)
 
-    run_comparison(prompt, models, args.system, save, output_path, no_think, sequential=args.sequential)
+    run_comparison(prompt, models, args.system, save, output_path, no_think,
+                   sequential=args.sequential, num_ctx=args.num_ctx)
 
     if args.json:
         # Re-run would be needed; just print what we have from the last run
