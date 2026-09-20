@@ -35,6 +35,16 @@ OLLAMA_BASE = "http://localhost:11434"
 console = Console()
 
 
+def _jevkit():
+    try:
+        import jevkit; return jevkit
+    except ImportError:
+        import os, sys
+        p = os.path.expanduser('~/typesafe-mcp')
+        if p not in sys.path: sys.path.insert(0, p)
+        import jevkit; return jevkit
+
+
 # ---------------------------------------------------------------------------
 # Ollama helpers
 # ---------------------------------------------------------------------------
@@ -174,6 +184,7 @@ def run_comparison(
     no_think: bool,
     sequential: bool = False,
     num_ctx: int = 0,
+    judge: bool = False,
 ):
     results = [ModelResponse(model=m) for m in models]
 
@@ -241,6 +252,22 @@ def run_comparison(
                         time.sleep(0.25)
                     live.update(build_display())
 
+    # Optional Jev ranking (opt-in via --judge/--rank)
+    jev = None
+    if judge:
+        try:
+            jk = _jevkit()
+            named = {r.model: r.response for r in results if not r.error}
+            if named:
+                jev = jk.best_of(prompt, named)
+        except Exception as e:
+            console.print(f"[yellow]Jev ranking unavailable: {e}[/yellow]")
+            jev = None
+
+    jev_values: dict[str, float] = {}
+    if jev:
+        jev_values = {name: val for name, val in jev.get("ranked", [])}
+
     # Summary table
     console.print()
     console.print(Rule("[dim]Summary[/dim]"))
@@ -250,17 +277,39 @@ def run_comparison(
     t.add_column("Tokens", justify="right")
     t.add_column("tok/s", justify="right")
     t.add_column("Words", justify="right")
+    if jev is not None:
+        t.add_column("Jev", justify="right")
 
     for r in sorted(results, key=lambda x: x.elapsed_s if x.elapsed_s > 0 else 9999):
         if r.error:
-            t.add_row(r.short_name, "[red]error[/red]", "—", "—", "—")
+            row = [r.short_name, "[red]error[/red]", "—", "—", "—"]
+            if jev is not None:
+                row.append("—")
+            t.add_row(*row)
         else:
             cleaned = strip_think(r.response) if no_think else r.response
             words = len(cleaned.split())
             fastest = min((x.tps for x in results if x.tps > 0), default=0)
             tps_str = f"[green]{r.tps:.0f}[/green]" if r.tps == fastest and fastest > 0 else f"{r.tps:.0f}"
-            t.add_row(r.short_name, f"{r.elapsed_s:.1f}s", str(r.tokens), tps_str, str(words))
+            row = [r.short_name, f"{r.elapsed_s:.1f}s", str(r.tokens), tps_str, str(words)]
+            if jev is not None:
+                if r.model in jev_values:
+                    val = jev_values[r.model]
+                    is_winner = (not jev.get("tie")) and jev.get("winner") == r.model
+                    row.append(f"[green]{val:.2f}[/green]" if is_winner else f"{val:.2f}")
+                else:
+                    row.append("—")
+            t.add_row(*row)
     console.print(t)
+
+    if jev is not None:
+        if jev.get("tie"):
+            console.print("[bold]Jev pick:[/bold] tie")
+        elif jev.get("winner"):
+            winner = jev["winner"]
+            conf = jev.get("scores", {}).get(winner, {}).get("confidence")
+            conf_str = f" (conf {conf:.2f})" if isinstance(conf, (int, float)) else ""
+            console.print(f"[bold]Jev pick:[/bold] {escape(winner)}{conf_str}")
 
     if save:
         path = output_path or Path(f"promptcmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
@@ -420,6 +469,9 @@ Examples:
                         help="Run structured benchmarks instead of a prompt. "
                              "SUITE: math, reasoning, coding, general, or all (default: all). "
                              "Requires localeval.py in the same dir or ~/localeval/")
+    parser.add_argument("--judge", "--rank", dest="judge", action="store_true",
+                        help="Rank responses by quality with Jev (TypeSafe judge). Adds a Jev "
+                             "column and picks a winner. Opt-in; default off.")
     parser.add_argument("--list", "-l", action="store_true", help="List available local models")
     parser.add_argument("--json", action="store_true", help="Also dump JSON results to stdout")
 
@@ -469,7 +521,7 @@ Examples:
     save = args.save or bool(args.output)
 
     run_comparison(prompt, models, args.system, save, output_path, no_think,
-                   sequential=args.sequential, num_ctx=args.num_ctx)
+                   sequential=args.sequential, num_ctx=args.num_ctx, judge=args.judge)
 
     if args.json:
         # Re-run would be needed; just print what we have from the last run
